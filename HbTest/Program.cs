@@ -13,8 +13,8 @@ namespace HbTest
 {
     class Program
     {
-        private const string FfmpegCmd = "ffmpeg.exe";
-        private const string FfprobeCmd = "ffprobe.exe";
+        private const string FFmpegCmd = "ffmpeg.exe";
+        private const string FFprobeCmd = "ffprobe.exe";
         private const double FrameDelay = 3; // seconds
 
         static void Main(string[] args)
@@ -89,9 +89,9 @@ namespace HbTest
             Console.WriteLine($"INFO: extracting audio from {inputName}");
 
             var output = new MemoryStream();
-            await RunFfmpegAsync("-vn -i - -f wav -bitexact -", input, output); // without -bitexact ffmpeg writes additional chunks in the WAV header which complicates things
+            await RunFFmpegAsync("-vn -i - -f wav -bitexact -", input, output); // without -bitexact ffmpeg writes additional chunks in the WAV header which complicates things
 
-            FixFfmpegWavOutput(output);
+            FixFFmpegWavOutput(output);
 
             output.Seek(0, SeekOrigin.Begin);
 
@@ -123,7 +123,7 @@ namespace HbTest
         /// to set size bits in the header, so we have to do it ourselves.
         /// ref: http://soundfile.sapp.org/doc/WaveFormat/
         /// </summary>
-        private static void FixFfmpegWavOutput(MemoryStream output)
+        private static void FixFFmpegWavOutput(MemoryStream output)
         {
             var chunkSize = (int) output.Length - 8;
             var csb = BitConverter.GetBytes(chunkSize);
@@ -141,7 +141,7 @@ namespace HbTest
             b[43] = scsb[3];
         }
 
-        private static async Task RunFfmpegAsync(string args, Stream input, Stream output, string command = FfmpegCmd)
+        private static async Task RunFFmpegAsync(string args, Stream input, Stream output, string command = FFmpegCmd)
         {
             var info = new ProcessStartInfo
             {
@@ -179,7 +179,7 @@ namespace HbTest
             Console.WriteLine($"INFO: extracting frames from {inputName}");
 
             var ffprobeOutput = new MemoryStream();
-            await RunFfmpegAsync("-i - -show_entries format=duration -of csv=\"p=0\"", input, ffprobeOutput, FfprobeCmd);
+            await RunFFmpegAsync("-i - -show_entries format=duration -of csv=\"p=0\"", input, ffprobeOutput, FFprobeCmd);
 
             var durationStr = System.Text.Encoding.ASCII.GetString(ffprobeOutput.GetBuffer(), 0, (int) ffprobeOutput.Length);
             var duration = double.Parse(durationStr, CultureInfo.InvariantCulture);
@@ -192,7 +192,7 @@ namespace HbTest
                 var output = new MemoryStream();
                 
                 input.Seek(0, SeekOrigin.Begin);
-                await RunFfmpegAsync($"-i - -ss {t} -vframes 1 -c:v png -f image2pipe -", input, output);
+                await RunFFmpegAsync($"-i - -ss {t} -vframes 1 -c:v png -f image2pipe -", input, output);
                 
                 output.Seek(0, SeekOrigin.Begin);
                 
