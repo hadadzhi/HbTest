@@ -4,6 +4,9 @@ using Microsoft.WindowsAzure.Storage.Blob;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -12,6 +15,10 @@ namespace HbTest
 {
     class Program
     {
+        private const string FfmpegCmd = "ffmpeg.exe";
+        private const string FfprobeCmd = "ffprobe.exe";
+        private const double FrameDelay = 3; // seconds
+
         static void Main(string[] args)
         {
             var account = new CloudStorageAccount(
@@ -88,14 +95,15 @@ namespace HbTest
 
             FixFfmpegWavOutput(output);
 
-            Console.WriteLine($"INFO: uploading audio extracted from {inputName}");
+            output.Seek(0, SeekOrigin.Begin);
 
-// For testing
+            // For testing
 //            using (var fs = File.Open("test.wav", FileMode.Create))
 //            {
 //                output.WriteTo(fs);
 //            }
 
+            Console.WriteLine($"INFO: uploading audio extracted from {inputName}");
             await UploadBlob("audios", $"{inputName}-audio-ng42.wav", output, client);
         }
 
@@ -109,7 +117,6 @@ namespace HbTest
 
             var blob = container.GetBlockBlobReference(blobName);
 
-            data.Seek(0, SeekOrigin.Begin);
             await blob.UploadFromStreamAsync(data);
         }
 
@@ -136,11 +143,11 @@ namespace HbTest
             b[43] = scsb[3];
         }
 
-        private static async Task RunFfmpegAsync(string args, Stream input, Stream output)
+        private static async Task RunFfmpegAsync(string args, Stream input, Stream output, string command = FfmpegCmd)
         {
             var info = new ProcessStartInfo
             {
-                FileName = @"ffmpeg\ffmpeg.exe",
+                FileName = $@"ffmpeg\{command}",
                 Arguments = args,
                 CreateNoWindow = false,
                 UseShellExecute = false,
@@ -157,9 +164,9 @@ namespace HbTest
 
                 var tIn = input.CopyToAsync(proc.StandardInput.BaseStream);
                 var tOut = proc.StandardOutput.BaseStream.CopyToAsync(output);
-                await tIn;
+                try { await tIn; } catch {/*Ignore stream errors: ffmpeg may exit before we finish writing to the stream, which is normal, and we'll see ffmpeg error output later*/}
                 proc.StandardInput.Close();
-                await tOut;
+                try { await tOut;} catch {/*Ignore stream errors: we'll see ffmpeg error output later*/}
                 proc.WaitForExit();
 
                 if (proc.ExitCode != 0)
@@ -173,14 +180,33 @@ namespace HbTest
         {
             Console.WriteLine($"INFO: extracting frames from {inputName}");
 
-            var output = new MemoryStream();
-            await RunFfmpegAsync("-i - -vf fps=1/3 -c:v png -f image2pipe -", input, output);
+            var ffprobeOutput = new MemoryStream();
+            await RunFfmpegAsync("-i - -show_entries format=duration -of csv=\"p=0\"", input, ffprobeOutput, FfprobeCmd);
 
-            Console.WriteLine($"INFO: uploading frames extracted from {inputName}");
+            var durationStr = System.Text.Encoding.ASCII.GetString(ffprobeOutput.GetBuffer(), 0, (int) ffprobeOutput.Length);
+            var duration = double.Parse(durationStr, CultureInfo.InvariantCulture);
 
-            // TODO split data into separate images and upload
+            var ts = new List<Task>();
+            var t = 0d;
+            var i = 0;
+            while (t < duration)
+            {
+                var output = new MemoryStream();
+                
+                input.Seek(0, SeekOrigin.Begin);
+                await RunFfmpegAsync($"-i - -ss {t} -vframes 1 -c:v png -f image2pipe -", input, output);
+                
+                output.Seek(0, SeekOrigin.Begin);
+                
+                t += FrameDelay;
 
-            throw new NotImplementedException();
+                // For testing
+//                ts.Add(image.CopyToAsync(File.Open($"image-{i++}.png", FileMode.Create)));
+
+                Console.WriteLine($"INFO: uploading frame {i} extracted from {inputName}");
+                ts.Add(UploadBlob("frames", $"{inputName}-frame_{i++}-ng42.png", output, client));
+            }
+            Task.WaitAll(ts.ToArray());
         }
     }
 }
