@@ -4,8 +4,6 @@ using Microsoft.WindowsAzure.Storage.Blob;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -21,13 +19,13 @@ namespace HbTest
 
         static void Main(string[] args)
         {
-            var account = new CloudStorageAccount(
-                new StorageCredentials(
-                    "hbgittest",
-                    "up4w+hjVi6jo+yXPrwi1t16G8sBPWZEocCqRMSzlaaJ2nntWfXvd3Ondk9J52FlxSLOm21fZRe26w14UcMQjLA=="
-                ),
-                true
-            );
+            if (args.Length != 2)
+            {
+                Console.WriteLine("Usage:\n\nHbTest <accountName> <keyValue>\n");
+                return;
+            }
+
+            var account = new CloudStorageAccount(new StorageCredentials(args[0], args[1]), true);
             var client = account.CreateCloudBlobClient();
 
             var vc = client.GetContainerReference("videos");
@@ -37,7 +35,6 @@ namespace HbTest
                 Environment.Exit(1);
             }
 
-            
             var taskList = new List<Task>();
             var blob = vc.ListBlobs().First();
             if (blob is CloudBlob cb)
@@ -52,6 +49,7 @@ namespace HbTest
                     catch (Exception ex)
                     {
                         Console.WriteLine($"ERROR: processing {cb.Name} has thrown:\n{ex}");
+                        Environment.ExitCode = 1;
                     }
                 });
                 taskList.Add(t);
@@ -100,7 +98,7 @@ namespace HbTest
             // For testing
 //            using (var fs = File.Open("test.wav", FileMode.Create))
 //            {
-//                output.WriteTo(fs);
+//                output.CopyTo(fs);
 //            }
 
             Console.WriteLine($"INFO: uploading audio extracted from {inputName}");
