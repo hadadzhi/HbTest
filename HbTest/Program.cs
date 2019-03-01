@@ -4,7 +4,9 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace HbTest
@@ -12,7 +14,6 @@ namespace HbTest
     internal class Program
     {
         private const string FFmpegCmd = "ffmpeg.exe";
-        private const string FFprobeCmd = "ffprobe.exe";
         private const double ImagesPerSecond = 1/3d;
 
         private const string InputPath = "input";
@@ -23,12 +24,14 @@ namespace HbTest
         {
             if (!Directory.Exists(InputPath))
             {
-                Logger.Error("input directory does not exist");
+                Logger.Error("Input directory does not exist");
                 Environment.Exit(1);
             }
 
             Directory.CreateDirectory(AudioPath);
             Directory.CreateDirectory(ImagesPath);
+
+            Logger.Info("Started");
 
             var taskList = new List<Task>();
             foreach (string file in Directory.EnumerateFiles(InputPath))
@@ -50,7 +53,7 @@ namespace HbTest
                     }
                     catch (Exception ex)
                     {
-                        Logger.Error($"processing {fileName} has thrown:\n{ex}");
+                        Logger.Error($"Processing {fileName} has thrown:\n{ex}");
                         Environment.ExitCode = 1;
                     }
                 });
@@ -58,12 +61,12 @@ namespace HbTest
             }
 
             Task.WaitAll(taskList.ToArray());
-            Logger.Info("all done, exiting");
+            Logger.Info("All done, exiting");
         }
 
         private static async Task ExtractAndSaveAudioAsync(Stream input, string inputName)
         {
-            Logger.Info($"extracting audio from {inputName}");
+            Logger.Info($"Extracting audio from {inputName}");
 
             var output = new MemoryStream();
             await RunFFmpegAsync("-vn -i - -f wav -bitexact -", input, output); // without -bitexact ffmpeg writes additional chunks in the WAV header which complicates things
@@ -72,7 +75,7 @@ namespace HbTest
 
             output.Seek(0, SeekOrigin.Begin);
 
-            Logger.Info($"extracted audio from {inputName}, writing");
+            Logger.Info($"Writing audio extracted from {inputName}");
 
             using (var fs = File.Open($@"{AudioPath}\{inputName}-audio.wav", FileMode.Create))
             {
@@ -162,34 +165,95 @@ namespace HbTest
 
         private static async Task ExtractAndSaveFramesAsync(Stream input, string inputName)
         {
-            Logger.Info($"extracting frames from {inputName}");
+            Logger.Info($"Extracting frames from {inputName}");
 
-            var ffprobeOutput = new MemoryStream();
-            await RunFFmpegAsync("-i - -show_entries format=duration -of csv=\"p=0\"", input, ffprobeOutput, FFprobeCmd);
+            var ffmpegOutput = new MemoryStream();
+            await RunFFmpegAsync($"-i - -vf fps=1/{(int) Math.Round(1 / ImagesPerSecond)} -c:v png -f image2pipe -", input, ffmpegOutput);
 
-            var durationStr = Encoding.ASCII.GetString(ffprobeOutput.GetBuffer(), 0, (int) ffprobeOutput.Length);
-            var duration = double.Parse(durationStr, CultureInfo.InvariantCulture);
+            ffmpegOutput.Seek(0, SeekOrigin.Begin);
 
-            var ts = new List<Task>();
-            var t = 0d;
+            Logger.Info($"Parsing frames extracted from {inputName}");
+            var images = ParseConcatenatedPNGs(ffmpegOutput);
+
+            Logger.Info($"Writing frames extracted from {inputName}");
             var i = 0;
-            while (t < duration)
+            foreach (var imageBytes in images)
             {
-                var output = new MemoryStream();
-                
-                input.Seek(0, SeekOrigin.Begin);
-                await RunFFmpegAsync($"-i - -ss {t} -vframes 1 -c:v png -f image2pipe -", input, output);
-                
-                output.Seek(0, SeekOrigin.Begin);
-
-                t += 1 / ImagesPerSecond;
-
-                Logger.Info($"extracted frame {i} from {inputName}, writing...");
-
-                var fileStream = File.Open($@"{ImagesPath}\{inputName}-image-{i++}.png", FileMode.Create);
-                ts.Add(output.CopyToAsync(fileStream).ContinueWith(task => fileStream.Close()));
+                File.WriteAllBytes($@"{ImagesPath}\{inputName}-image-{i++}.png", imageBytes);
             }
-            Task.WaitAll(ts.ToArray());
+        }
+
+        private static IEnumerable<byte[]> ParseConcatenatedPNGs(Stream stream)
+        {
+            var list = new List<byte[]>();
+            byte[] pngBytes;
+            while ((pngBytes = ReadOnePNG(stream)) != null)
+            {
+                list.Add(pngBytes);
+            }
+            return list;
+        }
+
+        private static readonly byte[] PngSignature = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+
+        private static byte[] ReadOnePNG(Stream stream)
+        {
+            var signature = new byte[8];
+            stream.Read(signature, 0, 8);
+            if (!signature.SequenceEqual(PngSignature))
+            {
+                return null; // PNG signature not found, assume end of stream
+            }
+
+            var ms = new MemoryStream();
+
+            ms.Write(signature, 0, signature.Length);
+
+            string chunkType = null;
+            while (chunkType != "IEND")
+            {
+                var length = CopyUInt32BE(stream, ms);
+                chunkType = CopyChunkType(stream, ms);
+                CopyChunk(length + 4, stream, ms, 4096); // length + 4 to copy CRC, too; bufsize == 4096 b/c typical chunk size for PNG
+            }
+
+            return ms.GetBuffer();
+        }
+
+        private static void CopyChunk(long length, Stream stream, Stream ms, int bufSize = 81920)
+        {
+            while (length > 0)
+            {
+                var b = new byte[Math.Min(length, bufSize)];
+                var read = stream.Read(b, 0, b.Length);
+                ms.Write(b, 0, b.Length);
+                length -= read;
+            }
+        }
+
+        private static uint CopyUInt32BE(Stream input, Stream output)
+        {
+            var b = new byte[4];
+            
+            input.Read(b, 0, 4);
+            output.Write(b, 0, 4);
+            
+            if (BitConverter.IsLittleEndian)
+            {
+                Array.Reverse(b);
+            }
+
+            return BitConverter.ToUInt32(b, 0);
+        }
+
+        private static string CopyChunkType(Stream input, Stream output)
+        {
+            var b = new byte[4];
+            
+            input.Read(b, 0, 4);
+            output.Write(b, 0, 4);
+
+            return Encoding.ASCII.GetString(b, 0, 4);
         }
     }
 }
