@@ -1,92 +1,69 @@
-﻿using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Auth;
-using Microsoft.WindowsAzure.Storage.Blob;
+﻿using HbTest.Logging;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
-using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace HbTest
 {
-    class Program
+    internal class Program
     {
         private const string FFmpegCmd = "ffmpeg.exe";
         private const string FFprobeCmd = "ffprobe.exe";
-        private const double FrameDelay = 3; // seconds
+        private const double ImagesPerSecond = 1/3d;
 
-        static void Main(string[] args)
+        private const string InputPath = "input";
+        private const string AudioPath = @"output\audio";
+        private const string ImagesPath = @"output\images";
+
+        private static void Main(string[] args)
         {
-            if (args.Length != 2)
+            if (!Directory.Exists(InputPath))
             {
-                Console.WriteLine("Usage:\n\nHbTest <accountName> <keyValue>\n");
-                return;
-            }
-
-            var account = new CloudStorageAccount(new StorageCredentials(args[0], args[1]), true);
-            var client = account.CreateCloudBlobClient();
-
-            var vc = client.GetContainerReference("videos");
-            if (!vc.Exists())
-            {
-                Console.WriteLine("ERROR: Container 'videos' does not exist");
+                Logger.Error("input directory does not exist");
                 Environment.Exit(1);
             }
 
+            Directory.CreateDirectory(AudioPath);
+            Directory.CreateDirectory(ImagesPath);
+
             var taskList = new List<Task>();
-            var blob = vc.ListBlobs().First();
-            if (blob is CloudBlob cb)
+            foreach (string file in Directory.EnumerateFiles(InputPath))
             {
                 // I couldn't figure out another way to call async methods from main since main itself can't be async :(
                 var t = Task.Run(async () =>
                 {
+                    var fileName = Path.GetFileName(file);
+
                     try
                     {
-                        await ProcessBlobAsync(cb, client);
+                        var ba = File.ReadAllBytes(file);
+
+                        var t1 = ExtractAndSaveAudioAsync(new MemoryStream(ba), fileName);
+                        var t2 = ExtractAndSaveFramesAsync(new MemoryStream(ba), fileName);
+
+                        await t1;
+                        await t2;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"ERROR: processing {cb.Name} has thrown:\n{ex}");
+                        Logger.Error($"processing {fileName} has thrown:\n{ex}");
                         Environment.ExitCode = 1;
                     }
                 });
                 taskList.Add(t);
             }
-            else
-            {
-                Console.WriteLine($"WARN: skipping {blob} (not a CloudBlob)");
-            }
 
             Task.WaitAll(taskList.ToArray());
+            Logger.Info("all done, exiting");
         }
 
-        private static async Task ProcessBlobAsync(CloudBlob blob, CloudBlobClient client)
+        private static async Task ExtractAndSaveAudioAsync(Stream input, string inputName)
         {
-            if (blob.Properties.ContentType != "video/mp4")
-            {
-                Console.WriteLine($"WARN: skipping {blob.Name} (not an mp4 file)");
-                return;
-            }
-
-            Console.WriteLine($"INFO: processing {blob.Name}: {blob.Uri}");
-
-            var ba = new byte[blob.Properties.Length];
-            await blob.DownloadToStreamAsync(new MemoryStream(ba));
-
-            var t1 = ExtractAndUploadAudioAsync(new MemoryStream(ba), blob.Name, client);
-            var t2 = ExtractAndUploadFramesAsync(new MemoryStream(ba), blob.Name, client);
-
-            await t1;
-            await t2;
-
-            Console.WriteLine($"INFO: finished processing {blob.Name}");
-        }
-
-        private static async Task ExtractAndUploadAudioAsync(Stream input, string inputName, CloudBlobClient client)
-        {
-            Console.WriteLine($"INFO: extracting audio from {inputName}");
+            Logger.Info($"extracting audio from {inputName}");
 
             var output = new MemoryStream();
             await RunFFmpegAsync("-vn -i - -f wav -bitexact -", input, output); // without -bitexact ffmpeg writes additional chunks in the WAV header which complicates things
@@ -95,27 +72,12 @@ namespace HbTest
 
             output.Seek(0, SeekOrigin.Begin);
 
-            // For testing
-//            using (var fs = File.Open("test.wav", FileMode.Create))
-//            {
-//                output.CopyTo(fs);
-//            }
+            Logger.Info($"extracted audio from {inputName}, writing");
 
-            Console.WriteLine($"INFO: uploading audio extracted from {inputName}");
-            await UploadBlob("audios", $"{inputName}-audio-ng42.wav", output, client);
-        }
-
-        private static async Task UploadBlob(string containerName, string blobName, Stream data, CloudBlobClient client)
-        {
-            var container = client.GetContainerReference(containerName);
-            if (!container.Exists())
+            using (var fs = File.Open($@"{AudioPath}\{inputName}-audio.wav", FileMode.Create))
             {
-                throw new Exception($"container '{containerName}' does not exist");
+                await output.CopyToAsync(fs);
             }
-
-            var blob = container.GetBlockBlobReference(blobName);
-
-            await blob.UploadFromStreamAsync(data);
         }
 
         /// <summary>
@@ -162,26 +124,50 @@ namespace HbTest
 
                 var tIn = input.CopyToAsync(proc.StandardInput.BaseStream);
                 var tOut = proc.StandardOutput.BaseStream.CopyToAsync(output);
-                try { await tIn; } catch {/*Ignore stream errors: ffmpeg may exit before we finish writing to the stream, which is normal, and we'll see ffmpeg error output later*/}
-                proc.StandardInput.Close();
-                try { await tOut;} catch {/*Ignore stream errors: we'll see ffmpeg error output later*/}
+
+                var stdErr = new StringBuilder();
+
+                proc.BeginErrorReadLine();
+                proc.ErrorDataReceived += (sender, eventArgs) => stdErr.Append(eventArgs.Data);
+
+                try
+                {
+                    await tIn;
+                    proc.StandardInput.Close();
+                }
+                catch
+                {
+                    // Ignore stream errors: ffmpeg may exit before we finish writing to the stream,
+                    // which is normal, and we'll see ffmpeg error output later
+                }
+
+                try
+                {
+                    await tOut;
+                    proc.StandardOutput.Close();
+                }
+                catch
+                {
+                    // Ignore stream errors: we'll see ffmpeg error output later
+                }
+
                 proc.WaitForExit();
 
                 if (proc.ExitCode != 0)
                 {
-                    throw new Exception($"ffmpeg error:\n{proc.StandardError.ReadToEnd()}");
+                    throw new Exception($"ffmpeg exited with error code {proc.ExitCode}:\n{stdErr}");
                 }
             }
         }
 
-        private static async Task ExtractAndUploadFramesAsync(Stream input, string inputName, CloudBlobClient client)
+        private static async Task ExtractAndSaveFramesAsync(Stream input, string inputName)
         {
-            Console.WriteLine($"INFO: extracting frames from {inputName}");
+            Logger.Info($"extracting frames from {inputName}");
 
             var ffprobeOutput = new MemoryStream();
             await RunFFmpegAsync("-i - -show_entries format=duration -of csv=\"p=0\"", input, ffprobeOutput, FFprobeCmd);
 
-            var durationStr = System.Text.Encoding.ASCII.GetString(ffprobeOutput.GetBuffer(), 0, (int) ffprobeOutput.Length);
+            var durationStr = Encoding.ASCII.GetString(ffprobeOutput.GetBuffer(), 0, (int) ffprobeOutput.Length);
             var duration = double.Parse(durationStr, CultureInfo.InvariantCulture);
 
             var ts = new List<Task>();
@@ -195,14 +181,13 @@ namespace HbTest
                 await RunFFmpegAsync($"-i - -ss {t} -vframes 1 -c:v png -f image2pipe -", input, output);
                 
                 output.Seek(0, SeekOrigin.Begin);
-                
-                t += FrameDelay;
 
-                // For testing
-//                ts.Add(image.CopyToAsync(File.Open($"image-{i++}.png", FileMode.Create)));
+                t += 1 / ImagesPerSecond;
 
-                Console.WriteLine($"INFO: uploading frame {i} extracted from {inputName}");
-                ts.Add(UploadBlob("frames", $"{inputName}-frame_{i++}-ng42.png", output, client));
+                Logger.Info($"extracted frame {i} from {inputName}, writing...");
+
+                var fileStream = File.Open($@"{ImagesPath}\{inputName}-image-{i++}.png", FileMode.Create);
+                ts.Add(output.CopyToAsync(fileStream).ContinueWith(task => fileStream.Close()));
             }
             Task.WaitAll(ts.ToArray());
         }
