@@ -4,9 +4,9 @@ using Microsoft.WindowsAzure.Storage.Blob;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace HbTest
@@ -14,7 +14,6 @@ namespace HbTest
     class Program
     {
         private const string FFmpegCmd = "ffmpeg.exe";
-        private const string FFprobeCmd = "ffprobe.exe";
         private const double FrameDelay = 3; // seconds
 
         static void Main(string[] args)
@@ -160,16 +159,19 @@ namespace HbTest
                     throw new Exception("ffmpeg failed to start");
                 }
 
+                var stdErr = new StringBuilder();
+                proc.BeginErrorReadLine();
+                proc.ErrorDataReceived += (sender, eventArgs) => stdErr.Append(eventArgs.Data);
+
                 var tIn = input.CopyToAsync(proc.StandardInput.BaseStream);
                 var tOut = proc.StandardOutput.BaseStream.CopyToAsync(output);
-                try { await tIn; } catch {/*Ignore stream errors: ffmpeg may exit before we finish writing to the stream, which is normal, and we'll see ffmpeg error output later*/}
-                proc.StandardInput.Close();
-                try { await tOut;} catch {/*Ignore stream errors: we'll see ffmpeg error output later*/}
+                try { await tIn; proc.StandardInput.Close(); } catch {/*Ignore stream errors: ffmpeg may exit before we finish writing to the stream, which is normal, and we'll see ffmpeg error output later*/}
+                try { await tOut; proc.StandardOutput.Close(); } catch {/*Ignore stream errors: we'll see ffmpeg error output later*/}
                 proc.WaitForExit();
 
                 if (proc.ExitCode != 0)
                 {
-                    throw new Exception($"ffmpeg error:\n{proc.StandardError.ReadToEnd()}");
+                    throw new Exception($"ffmpeg error:\n{stdErr}");
                 }
             }
         }
@@ -178,33 +180,95 @@ namespace HbTest
         {
             Console.WriteLine($"INFO: extracting frames from {inputName}");
 
-            var ffprobeOutput = new MemoryStream();
-            await RunFFmpegAsync("-i - -show_entries format=duration -of csv=\"p=0\"", input, ffprobeOutput, FFprobeCmd);
+            var ffmpegOutput = new MemoryStream();
+            await RunFFmpegAsync($"-i - -vf fps=1/{FrameDelay} -c:v png -f image2pipe -", input, ffmpegOutput);
 
-            var durationStr = System.Text.Encoding.ASCII.GetString(ffprobeOutput.GetBuffer(), 0, (int) ffprobeOutput.Length);
-            var duration = double.Parse(durationStr, CultureInfo.InvariantCulture);
+            ffmpegOutput.Seek(0, SeekOrigin.Begin);
 
-            var ts = new List<Task>();
-            var t = 0d;
-            var i = 0;
-            while (t < duration)
+            Console.WriteLine($"INFO: parsing frames extracted from {inputName}");
+            var images = ParseConcatenatedPNGs(ffmpegOutput);
+
+            Console.WriteLine($"INFO: uploading frames extracted from {inputName}");
+            Task.WaitAll(
+                images
+                    .Select(image => new MemoryStream(image))
+                    .Select((stream, idx) =>UploadBlob("frames", $@"{inputName}-image-{idx}.png", stream, client))
+                    .ToArray()
+            );
+        }
+
+        private static IEnumerable<byte[]> ParseConcatenatedPNGs(Stream stream)
+        {
+            var list = new List<byte[]>();
+            byte[] pngBytes;
+            while ((pngBytes = ReadOnePNG(stream)) != null)
             {
-                var output = new MemoryStream();
-                
-                input.Seek(0, SeekOrigin.Begin);
-                await RunFFmpegAsync($"-i - -ss {t} -vframes 1 -c:v png -f image2pipe -", input, output);
-                
-                output.Seek(0, SeekOrigin.Begin);
-                
-                t += FrameDelay;
-
-                // For testing
-//                ts.Add(image.CopyToAsync(File.Open($"image-{i++}.png", FileMode.Create)));
-
-                Console.WriteLine($"INFO: uploading frame {i} extracted from {inputName}");
-                ts.Add(UploadBlob("frames", $"{inputName}-frame_{i++}-ng42.png", output, client));
+                list.Add(pngBytes);
             }
-            Task.WaitAll(ts.ToArray());
+
+            return list;
+        }
+
+        private static readonly byte[] PngSignature = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+
+        private static byte[] ReadOnePNG(Stream stream)
+        {
+            var signature = new byte[8];
+            stream.Read(signature, 0, 8);
+            if (!signature.SequenceEqual(PngSignature))
+            {
+                return null; // PNG signature not found, assume end of stream
+            }
+
+            var ms = new MemoryStream();
+
+            ms.Write(signature, 0, signature.Length);
+
+            string chunkType = null;
+            while (chunkType != "IEND")
+            {
+                var length = CopyUInt32BE(stream, ms);
+                chunkType = CopyChunkType(stream, ms);
+                CopyChunk(length + 4, stream, ms, 4096); // length + 4 to copy CRC, too; bufsize == 4096 b/c typical chunk size for PNG
+            }
+
+            return ms.GetBuffer();
+        }
+
+        private static void CopyChunk(long length, Stream stream, Stream ms, int bufSize = 81920)
+        {
+            while (length > 0)
+            {
+                var b = new byte[Math.Min(length, bufSize)];
+                var read = stream.Read(b, 0, b.Length);
+                ms.Write(b, 0, b.Length);
+                length -= read;
+            }
+        }
+
+        private static uint CopyUInt32BE(Stream input, Stream output)
+        {
+            var b = new byte[4];
+
+            input.Read(b, 0, 4);
+            output.Write(b, 0, 4);
+
+            if (BitConverter.IsLittleEndian)
+            {
+                Array.Reverse(b);
+            }
+
+            return BitConverter.ToUInt32(b, 0);
+        }
+
+        private static string CopyChunkType(Stream input, Stream output)
+        {
+            var b = new byte[4];
+
+            input.Read(b, 0, 4);
+            output.Write(b, 0, 4);
+
+            return Encoding.ASCII.GetString(b, 0, 4);
         }
     }
 }
