@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Threading;
 
 namespace HbTest.Logging
@@ -29,9 +30,56 @@ namespace HbTest.Logging
         public static Level Level = Level.Debug;
         public static bool Enabled = true;
 
-        private static void WriteLogMessage(string message, Level level)
+        private struct Message
         {
-            if (!Enabled || level.IntValue > Level.IntValue)
+            public int ThreadId;
+            public DateTime Timestamp;
+            public string Value;
+            public Level Level;
+        }
+
+        private static readonly BlockingCollection<Message> Queue = new BlockingCollection<Message>();
+
+        private static Thread WriterThread = new Thread(() =>
+        {
+            try
+            {
+                while (true)
+                {
+                    var message = Queue.Take();
+                    WriteMessageColored(message);
+                }
+            }
+            catch (ThreadInterruptedException)
+            {
+                // Write remaining messages (no more should arrive) and exit cleanly
+                foreach (var message in Queue)
+                {
+                    WriteMessageColored(message);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex);
+            }
+        });
+
+        private static void EnqueueMessage(string message, Level level)
+        {
+            var msg = new Message {Timestamp = DateTime.Now, ThreadId = Thread.CurrentThread.ManagedThreadId, Level = level, Value = message};
+            if (WriterThread.IsAlive)
+            {
+                Queue.Add(msg);
+            }
+            else
+            {
+                WriteMessageColored(msg);
+            }
+        }
+
+        private static void WriteMessageColored(Message message)
+        {
+            if (!Enabled || message.Level.IntValue > Level.IntValue)
             {
                 return;
             }
@@ -39,35 +87,48 @@ namespace HbTest.Logging
             var oldColor = Console.ForegroundColor;
 
             Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.Write(DateTime.Now.ToString(DateFormat));
+            Console.Write(message.Timestamp.ToString(DateFormat));
 
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.Write(" [" + Thread.CurrentThread.ManagedThreadId + "] ");
+            Console.Write(" [" + message.ThreadId + "] ");
 
-            Console.ForegroundColor = level.Color;
-            Console.WriteLine(level.Name + ": " + message);
+            Console.ForegroundColor = message.Level.Color;
+            Console.WriteLine(message.Level.Name + ": " + message.Value);
 
             Console.ForegroundColor = oldColor;
         }
 
+        public static void StartAsyncWriter()
+        {
+            if (!WriterThread.IsAlive)
+            {
+                WriterThread.Start();
+            }
+        }
+
+        public static void StopAsyncWriter()
+        {
+            WriterThread.Interrupt();
+        }
+
         public static void Error(string message)
         {
-            WriteLogMessage(message, Level.Error);
+            EnqueueMessage(message, Level.Error);
         }
 
         public static void Info(string message)
         {
-            WriteLogMessage(message, Level.Info);
+            EnqueueMessage(message, Level.Info);
         }
 
         public static void Debug(string message)
         {
-            WriteLogMessage(message, Level.Debug);
+            EnqueueMessage(message, Level.Debug);
         }
 
         public static void Trace(string message)
         {
-            WriteLogMessage(message, Level.Trace);
+            EnqueueMessage(message, Level.Trace);
         }
     }
 }

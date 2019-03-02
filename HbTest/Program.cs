@@ -2,11 +2,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 
 namespace HbTest
@@ -32,12 +30,10 @@ namespace HbTest
             Directory.CreateDirectory(ImagesPath);
 
             Logger.Info("Started");
-
-            var taskList = new List<Task>();
-            foreach (string file in Directory.EnumerateFiles(InputPath))
+            Logger.StartAsyncWriter();
+            try
             {
-                // I couldn't figure out another way to call async methods from main since main itself can't be async :(
-                var t = Task.Run(async () =>
+                foreach (var file in Directory.EnumerateFiles(InputPath))
                 {
                     var fileName = Path.GetFileName(file);
 
@@ -45,31 +41,30 @@ namespace HbTest
                     {
                         var ba = File.ReadAllBytes(file);
 
-                        var t1 = ExtractAndSaveAudioAsync(new MemoryStream(ba), fileName);
-                        var t2 = ExtractAndSaveFramesAsync(new MemoryStream(ba), fileName);
-
-                        await t1;
-                        await t2;
+                        ExtractAndSaveAudio(new MemoryStream(ba), fileName);
+                        ExtractAndSaveFrames(new MemoryStream(ba), fileName);
                     }
                     catch (Exception ex)
                     {
                         Logger.Error($"Processing {fileName} has thrown:\n{ex}");
                         Environment.ExitCode = 1;
                     }
-                });
-                taskList.Add(t);
-            }
+                }
 
-            Task.WaitAll(taskList.ToArray());
-            Logger.Info("All done, exiting");
+                Logger.Info("All done, exiting");
+            }
+            finally
+            {
+                Logger.StopAsyncWriter();
+            }
         }
 
-        private static async Task ExtractAndSaveAudioAsync(Stream input, string inputName)
+        private static void ExtractAndSaveAudio(Stream input, string inputName)
         {
             Logger.Info($"Extracting audio from {inputName}");
 
             var output = new MemoryStream();
-            await RunFFmpegAsync("-vn -i - -f wav -bitexact -", input, output); // without -bitexact ffmpeg writes additional chunks in the WAV header which complicates things
+            RunFFmpegAsync("-vn -i - -f wav -bitexact -", input, output); // without -bitexact ffmpeg writes additional chunks in the WAV header which complicates things
 
             FixFFmpegWavOutput(output);
 
@@ -79,7 +74,7 @@ namespace HbTest
 
             using (var fs = File.Open($@"{AudioPath}\{inputName}-audio.wav", FileMode.Create))
             {
-                await output.CopyToAsync(fs);
+                output.CopyTo(fs);
             }
         }
 
@@ -106,7 +101,7 @@ namespace HbTest
             b[43] = scsb[3];
         }
 
-        private static async Task RunFFmpegAsync(string args, Stream input, Stream output, string command = FFmpegCmd)
+        private static void RunFFmpegAsync(string args, Stream input, Stream output, string command = FFmpegCmd)
         {
             var info = new ProcessStartInfo
             {
@@ -125,34 +120,24 @@ namespace HbTest
                     throw new Exception("ffmpeg failed to start");
                 }
 
-                var tIn = input.CopyToAsync(proc.StandardInput.BaseStream);
-                var tOut = proc.StandardOutput.BaseStream.CopyToAsync(output);
-
                 var stdErr = new StringBuilder();
 
                 proc.BeginErrorReadLine();
                 proc.ErrorDataReceived += (sender, eventArgs) => stdErr.Append(eventArgs.Data);
 
-                try
+                var tIn = Task.Run(() =>
                 {
-                    await tIn;
-                    proc.StandardInput.Close();
-                }
-                catch
-                {
-                    // Ignore stream errors: ffmpeg may exit before we finish writing to the stream,
-                    // which is normal, and we'll see ffmpeg error output later
-                }
+                    input.CopyTo(proc.StandardInput.BaseStream);
+                    proc.StandardInput.BaseStream.Close();
+                });
 
                 try
                 {
-                    await tOut;
+                    proc.StandardOutput.BaseStream.CopyTo(output);
                     proc.StandardOutput.Close();
+                    Task.WaitAll(tIn);
                 }
-                catch
-                {
-                    // Ignore stream errors: we'll see ffmpeg error output later
-                }
+                catch { /*Ignore stream exceptions: the streams may close because ffmpeg exited prematurely, we'll see ffmpeg output later*/ }
 
                 proc.WaitForExit();
 
@@ -163,12 +148,12 @@ namespace HbTest
             }
         }
 
-        private static async Task ExtractAndSaveFramesAsync(Stream input, string inputName)
+        private static void ExtractAndSaveFrames(Stream input, string inputName)
         {
             Logger.Info($"Extracting frames from {inputName}");
 
             var ffmpegOutput = new MemoryStream();
-            await RunFFmpegAsync($"-i - -vf fps=1/{(int) Math.Round(1 / ImagesPerSecond)} -c:v png -f image2pipe -", input, ffmpegOutput);
+            RunFFmpegAsync($"-i - -vf fps=1/{(int) Math.Round(1 / ImagesPerSecond)} -c:v png -f image2pipe -", input, ffmpegOutput);
 
             ffmpegOutput.Seek(0, SeekOrigin.Begin);
 
@@ -176,11 +161,15 @@ namespace HbTest
             var images = ParseConcatenatedPNGs(ffmpegOutput);
 
             Logger.Info($"Writing frames extracted from {inputName}");
-            var i = 0;
-            foreach (var imageBytes in images)
-            {
-                File.WriteAllBytes($@"{ImagesPath}\{inputName}-image-{i++}.png", imageBytes);
-            }
+            Task.WaitAll(
+                images
+                    .Select(image => new MemoryStream(image))
+                    .Select((stream, idx) => stream
+                        .CopyToAsync(File.Open($@"{ImagesPath}\{inputName}-image-{idx}.png", FileMode.Create))
+                        .ContinueWith(task => stream.Close())
+                    )
+                    .ToArray()
+            );
         }
 
         private static IEnumerable<byte[]> ParseConcatenatedPNGs(Stream stream)
