@@ -38,7 +38,7 @@ namespace HbTest
             var blob = vc.ListBlobs().First();
             if (blob is CloudBlob cb)
             {
-                // I couldn't figure out another way to call async methods from main since main itself can't be async :(
+                // Couldn't figure out another way to call async methods from main since main itself can't be async :(
                 var t = Task.Run(async () =>
                 {
                     try
@@ -192,7 +192,7 @@ namespace HbTest
             Task.WaitAll(
                 images
                     .Select(image => new MemoryStream(image))
-                    .Select((stream, idx) =>UploadBlob("frames", $@"{inputName}-image-{idx}.png", stream, client))
+                    .Select((stream, idx) => UploadBlob("frames", $@"{inputName}-image-{idx}.png", stream, client))
                     .ToArray()
             );
         }
@@ -201,6 +201,7 @@ namespace HbTest
         {
             var list = new List<byte[]>();
             byte[] pngBytes;
+            
             while ((pngBytes = ReadOnePNG(stream)) != null)
             {
                 list.Add(pngBytes);
@@ -229,19 +230,19 @@ namespace HbTest
             {
                 var length = CopyUInt32BE(stream, ms);
                 chunkType = CopyChunkType(stream, ms);
-                CopyChunk(length + 4, stream, ms, 4096); // length + 4 to copy CRC, too; bufsize == 4096 b/c typical chunk size for PNG
+                CopyChunk(length + 4, stream, ms, 4100); // length + 4 to copy CRC, too; bufsize == 4100 b/c typical data+crc length for PNG
             }
 
             return ms.GetBuffer();
         }
 
-        private static void CopyChunk(long length, Stream stream, Stream ms, int bufSize = 81920)
+        private static void CopyChunk(long length, Stream input, Stream output, int bufSize = 81920)
         {
             while (length > 0)
             {
                 var b = new byte[Math.Min(length, bufSize)];
-                var read = stream.Read(b, 0, b.Length);
-                ms.Write(b, 0, b.Length);
+                var read = input.Read(b, 0, b.Length);
+                output.Write(b, 0, b.Length);
                 length -= read;
             }
         }
