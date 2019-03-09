@@ -198,24 +198,29 @@ namespace HbTest
 
             ms.Write(signature, 0, signature.Length);
 
+            var buffer = new byte[4100]; // bufsize == 4100 b/c typical data+CRC length for PNG
             string chunkType = null;
             while (chunkType != "IEND")
             {
                 var length = CopyUInt32BE(stream, ms);
                 chunkType = CopyChunkType(stream, ms);
-                CopyChunk(length + 4, stream, ms, 4096); // length + 4 to copy CRC, too; bufsize == 4096 b/c typical chunk size for PNG
+                CopyChunk(length + 4, stream, ms, buffer); // length + 4 to copy CRC, too
             }
 
             return ms.GetBuffer();
         }
 
-        private static void CopyChunk(long length, Stream stream, Stream ms, int bufSize = 81920)
+        private static void CopyChunk(long length, Stream input, Stream output, byte[] buffer)
         {
             while (length > 0)
             {
-                var b = new byte[Math.Min(length, bufSize)];
-                var read = stream.Read(b, 0, b.Length);
-                ms.Write(b, 0, b.Length);
+                var toRead = (int) Math.Min(length, buffer.Length);
+                var read = input.Read(buffer, 0, toRead);
+                if (read == 0)
+                {
+                    throw new EndOfStreamException();
+                }
+                output.Write(buffer, 0, read);
                 length -= read;
             }
         }
